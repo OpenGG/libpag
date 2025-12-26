@@ -22,10 +22,10 @@ jobs:
             artifact: pag2webp-mac-arm64
 
           # 可选：Intel（不需要就删掉这一段）
-          - os: macos-13
-            arch: x64
-            osx_arch: x86_64
-            artifact: pag2webp-mac-x64
+          # - os: macos-13
+          #   arch: x64
+          #   osx_arch: x86_64
+          #   artifact: pag2webp-mac-x64
 
     steps:
       - name: Check Out Repo
