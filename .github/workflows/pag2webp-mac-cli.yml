@@ -132,11 +132,6 @@ jobs:
             --loop N               0=infinite (default: 0)
             --no_unpremultiply     disable unpremultiply (default: enabled)
 
-            --replace_image path.png
-            --replace_text "text..."
-            --text_font path.ttf|otf
-            --fallback_font path.ttf|otf   (repeatable)
-
           Example:
             pag2webp a.pag a.webp --quality 80 --loop 0
           )";
@@ -160,45 +155,10 @@ jobs:
 
             const bool doUnpremultiply = !HasFlag(argc, argv, "--no_unpremultiply");
 
-            const char* replaceImage = GetArg(argc, argv, "--replace_image", nullptr);
-            const char* replaceText  = GetArg(argc, argv, "--replace_text", nullptr);
-            const char* textFontPath = GetArg(argc, argv, "--text_font", nullptr);
-            const auto fallbackFonts = GetMultiArgs(argc, argv, "--fallback_font");
-
-            if (!fallbackFonts.empty()) {
-              std::vector<int> ttcIndices(fallbackFonts.size(), 0);
-              pag::PAGFont::SetFallbackFontPaths(fallbackFonts, ttcIndices);
-            }
-
             auto pagFile = pag::PAGFile::Load(inPath);
             if (!pagFile) {
               std::cerr << "Failed to load PAG: " << inPath << "\n";
               return 2;
-            }
-
-            if (replaceImage) {
-              for (int i = 0; i < pagFile->numImages(); i++) {
-                auto img = pag::PAGImage::FromPath(replaceImage);
-                pagFile->replaceImage(i, img);
-              }
-            }
-
-            if (replaceText) {
-              pag::PAGFont used{};
-              bool hasFont = false;
-              if (textFontPath) {
-                used = pag::PAGFont::RegisterFont(textFontPath, 0);
-                hasFont = true;
-              }
-              for (int i = 0; i < pagFile->numTexts(); i++) {
-                auto textDoc = pagFile->getTextData(i);
-                textDoc->text = replaceText;
-                if (hasFont) {
-                  textDoc->fontFamily = used.fontFamily;
-                  textDoc->fontStyle = used.fontStyle;
-                }
-                pagFile->replaceText(i, textDoc);
-              }
             }
 
             const int w = pagFile->width();
