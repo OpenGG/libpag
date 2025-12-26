@@ -8,24 +8,9 @@ on:
     branches: [ main ]
 
 jobs:
-  mac_cli:
-    name: mac_cli (${{ matrix.arch }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # ✅ Apple Silicon (优先)
-          - os: macos-latest
-            arch: arm64
-            osx_arch: arm64
-            artifact: pag2webp-mac-arm64
-
-          # 可选：Intel（不需要就删掉这一段）
-          # - os: macos-13
-          #   arch: x64
-          #   osx_arch: x86_64
-          #   artifact: pag2webp-mac-x64
+  mac_cli_arm64:
+    name: mac_cli_arm64
+    runs-on: macos-latest
 
     steps:
       - name: Check Out Repo
@@ -36,31 +21,32 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: third_party
-          key: third-party-maccli-${{ matrix.arch }}-${{ hashFiles('DEPS') }}-${{ hashFiles('vendor.json') }}
-          restore-keys: third-party-maccli-${{ matrix.arch }}-
+          key: third-party-maccli-arm64-${{ hashFiles('DEPS') }}-${{ hashFiles('vendor.json') }}
+          restore-keys: third-party-maccli-arm64-
 
       - name: Install deps (brew)
+        shell: bash
         run: |
           brew update
           brew install cmake ninja yasm pkg-config webp
-        shell: bash
 
       - name: Install Build Tools
+        shell: bash
         run: |
           chmod +x install_tools.sh
           ./install_tools.sh
-        shell: bash
 
       - name: Run depsync
+        shell: bash
         run: |
           npm install depsync -g
           depsync
-        shell: bash
 
       # ------------------------------------------------------------
-      # 1) 在 CI 内 patch：覆盖 linux/src/main.cpp -> animated webp CLI
+      # 1) Patch main.cpp -> PAG -> animated WebP CLI
       # ------------------------------------------------------------
       - name: Patch linux/src/main.cpp (PAG -> animated WebP)
+        shell: bash
         run: |
           set -e
           cat > linux/src/main.cpp <<'CPP'
@@ -85,6 +71,7 @@ jobs:
             out.close();
           }
 
+          // libpag readPixels 返回 Premultiplied alpha，编码前建议反预乘，避免边缘发黑
           static void UnpremultiplyBGRA(uint8_t* bgra, int w, int h) {
             const int n = w * h;
             for (int i = 0; i < n; i++) {
@@ -114,25 +101,17 @@ jobs:
             return false;
           }
 
-          static std::vector<std::string> GetMultiArgs(int argc, char** argv, const char* key) {
-            std::vector<std::string> res;
-            for (int i = 1; i + 1 < argc; i++) {
-              if (std::string(argv[i]) == key) res.emplace_back(argv[i + 1]);
-            }
-            return res;
-          }
-
           static void Usage() {
             std::cerr <<
           R"(Usage:
             pag2webp input.pag output.webp [options]
 
           Options:
-            --fps N                override fps (default: PAG frameRate)
-            --quality Q            0..100 (default: 75)
-            --lossless 0|1         (default: 0)
-            --loop N               0=infinite (default: 0)
-            --no_unpremultiply     disable unpremultiply (default: enabled)
+            --fps N            override fps (default: PAG frameRate)
+            --quality Q        0..100 (default: 75)
+            --lossless 0|1     (default: 0)
+            --loop N           0=infinite (default: 0)
+            --no_unpremultiply disable unpremultiply (default: enabled)
 
           Example:
             pag2webp a.pag a.webp --quality 80 --loop 0
@@ -267,12 +246,12 @@ jobs:
             return 0;
           }
           CPP
-        shell: bash
 
       # ------------------------------------------------------------
-      # 2) 在 CI 内 patch：覆盖 linux/CMakeLists.txt -> 适配 mac + webp
+      # 2) Patch CMakeLists: mac + libpag.a + swiftshader dylib + webp/webpmux
       # ------------------------------------------------------------
       - name: Patch linux/CMakeLists.txt (mac + webp)
+        shell: bash
         run: |
           set -e
           cat > linux/CMakeLists.txt <<'CMAKE'
@@ -338,19 +317,17 @@ jobs:
 
           target_link_libraries(pag2webp ${libs})
           CMAKE
-        shell: bash
 
       # ------------------------------------------------------------
-      # 3) 自动复制/归一化：build_pag + headers + swiftshader -> linux/vendor/...
+      # 3) Build libpag.a via build_pag + stage headers + stage swiftshader dylib
       # ------------------------------------------------------------
       - name: Build libpag (static) and stage vendor deps
+        shell: bash
         run: |
           set -e
-          ARCH="${{ matrix.arch }}"
+          ARCH="arm64"
 
           mkdir -p third_party/tgfx/out/cache
-
-          # libpag output dir (we'll normalize afterwards)
           mkdir -p linux/vendor/libpag/mac
           mkdir -p linux/vendor/libpag/include
           mkdir -p linux/vendor/swiftshader/mac/$ARCH
@@ -361,12 +338,10 @@ jobs:
             -DPAG_BUILD_FRAMEWORK=OFF \
             -o linux/vendor/libpag/mac
 
-          # headers
           rm -rf linux/vendor/libpag/include
           mkdir -p linux/vendor/libpag/include
           cp -a include/* linux/vendor/libpag/include/
 
-          # swiftshader dylibs for this arch
           if [ ! -d "third_party/tgfx/vendor/swiftshader/mac/$ARCH" ]; then
             echo "SwiftShader dir not found: third_party/tgfx/vendor/swiftshader/mac/$ARCH"
             ls -la third_party/tgfx/vendor/swiftshader/mac || true
@@ -374,7 +349,6 @@ jobs:
           fi
           cp -a third_party/tgfx/vendor/swiftshader/mac/$ARCH/* linux/vendor/swiftshader/mac/$ARCH/
 
-          # build_pag 已经输出到固定路径：不要再 self-copy
           if [ ! -f "linux/vendor/libpag/mac/$ARCH/libpag.a" ]; then
             echo "Expected libpag.a missing: linux/vendor/libpag/mac/$ARCH/libpag.a"
             find linux/vendor/libpag/mac -maxdepth 6 -name libpag.a -print || true
@@ -385,56 +359,114 @@ jobs:
           ls -la "linux/vendor/libpag/mac/$ARCH/libpag.a"
           ls -la "linux/vendor/swiftshader/mac/$ARCH/libEGL.dylib"
           ls -la "linux/vendor/swiftshader/mac/$ARCH/libGLESv2.dylib"
-        shell: bash
 
       # ------------------------------------------------------------
-      # 4) build + 打包 + 上传 artifact
+      # 4) Build CLI
       # ------------------------------------------------------------
       - name: Build pag2webp
+        shell: bash
         run: |
           set -e
-          ARCH="${{ matrix.arch }}"
           export PKG_CONFIG_PATH="$(brew --prefix webp)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          export MACOSX_DEPLOYMENT_TARGET="11.0"
 
           cmake -S linux -B linux/build_cli -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DPAG_ARCH="$ARCH" \
-            -DCMAKE_OSX_ARCHITECTURES="${{ matrix.osx_arch }}"
+            -DPAG_ARCH="arm64" \
+            -DCMAKE_OSX_ARCHITECTURES="arm64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET}"
 
           cmake --build linux/build_cli --target pag2webp -j 8
-        shell: bash
 
-      - name: Package
+      # ------------------------------------------------------------
+      # 5) Package: copy dylibs (swiftshader + webp), rewrite install names, add rpath, ad-hoc codesign
+      # ------------------------------------------------------------
+      - name: Package portable (no brew needed on target mac)
+        shell: bash
         run: |
           set -e
-          ARCH="${{ matrix.arch }}"
+          ARCH="arm64"
+          WEBP_PREFIX="$(brew --prefix webp)"
+
+          rm -rf dist
           mkdir -p dist
 
           cp linux/build_cli/pag2webp dist/pag2webp
           chmod +x dist/pag2webp
 
+          # SwiftShader (必需)
           cp "linux/vendor/swiftshader/mac/$ARCH/libEGL.dylib" dist/
           cp "linux/vendor/swiftshader/mac/$ARCH/libGLESv2.dylib" dist/
 
+          # libwebp: 把 brew 的 dylib 一起带上（目标机无 brew 也能跑）
+          # 不同版本可能有不同后缀，这里用通配符拷贝常见集合
+          cp -a "$WEBP_PREFIX/lib"/libwebp*.dylib dist/ || true
+          cp -a "$WEBP_PREFIX/lib"/libwebpmux*.dylib dist/ || true
+          cp -a "$WEBP_PREFIX/lib"/libwebpdemux*.dylib dist/ || true
+          cp -a "$WEBP_PREFIX/lib"/libsharpyuv*.dylib dist/ || true
+
+          # 给可执行文件加 rpath：从自身目录找 dylib
+          install_name_tool -add_rpath "@executable_path" dist/pag2webp || true
+
+          # 统一所有 dylib 的 install id 为 @rpath/xxx.dylib
+          for f in dist/*.dylib; do
+            bn="$(basename "$f")"
+            install_name_tool -id "@rpath/$bn" "$f" || true
+          done
+
+          # 把 pag2webp 里“绝对路径依赖”改成 @rpath/xxx
+          while read -r dep; do
+            [ -z "$dep" ] && continue
+            case "$dep" in
+              "$WEBP_PREFIX"/lib/*|/Users/runner/*|/private/var/*|/opt/homebrew/*)
+                bn="$(basename "$dep")"
+                if [ -f "dist/$bn" ]; then
+                  install_name_tool -change "$dep" "@rpath/$bn" dist/pag2webp || true
+                fi
+              ;;
+            esac
+          done < <(otool -L dist/pag2webp | awk 'NR>1{print $1}')
+
+          # 同理：把 dist 里 dylib 的依赖也改成 @rpath（避免它们继续引用 /opt/homebrew/...）
+          for lib in dist/*.dylib; do
+            while read -r dep; do
+              [ -z "$dep" ] && continue
+              case "$dep" in
+                "$WEBP_PREFIX"/lib/*|/opt/homebrew/*|/Users/runner/*|/private/var/*)
+                  bn="$(basename "$dep")"
+                  if [ -f "dist/$bn" ]; then
+                    install_name_tool -change "$dep" "@rpath/$bn" "$lib" || true
+                  fi
+                ;;
+              esac
+            done < <(otool -L "$lib" | awk 'NR>1{print $1}')
+          done
+
+          # ad-hoc codesign：install_name_tool 会破坏原签名，必须重签，否则有概率 dyld 拒绝加载
+          codesign --force --sign - dist/pag2webp
+          for f in dist/*.dylib; do
+            codesign --force --sign - "$f" || true
+          done
+
+          # 便捷脚本（可选）
           cat > dist/run.sh <<'EOF'
           #!/usr/bin/env bash
           set -e
           DIR="$(cd "$(dirname "$0")" && pwd)"
-          export DYLD_LIBRARY_PATH="$DIR:${DYLD_LIBRARY_PATH:-}"
           exec "$DIR/pag2webp" "$@"
           EOF
           chmod +x dist/run.sh
 
-          echo "== file =="
-          file dist/pag2webp
-          echo "== otool -L =="
+          echo "== otool -L pag2webp =="
           otool -L dist/pag2webp || true
-        shell: bash
+
+          echo "== dist contents =="
+          ls -la dist
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
+          name: pag2webp-mac-arm64-portable
           path: dist/*
 
       - name: Save Third-Party Cache
@@ -442,4 +474,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: third_party
-          key: third-party-maccli-${{ matrix.arch }}-${{ hashFiles('DEPS') }}-${{ hashFiles('vendor.json') }}
+          key: third-party-maccli-arm64-${{ hashFiles('DEPS') }}-${{ hashFiles('vendor.json') }}
