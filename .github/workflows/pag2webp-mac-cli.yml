@@ -71,7 +71,6 @@ jobs:
             out.close();
           }
 
-          // libpag readPixels 返回 Premultiplied alpha，编码前建议反预乘，避免边缘发黑
           static void UnpremultiplyBGRA(uint8_t* bgra, int w, int h) {
             const int n = w * h;
             for (int i = 0; i < n; i++) {
@@ -248,7 +247,7 @@ jobs:
           CPP
 
       # ------------------------------------------------------------
-      # 2) Patch CMakeLists: mac + libpag.a + swiftshader dylib + webp/webpmux
+      # 2) Patch CMakeLists: FIX webp link by using PkgConfig imported targets
       # ------------------------------------------------------------
       - name: Patch linux/CMakeLists.txt (mac + webp)
         shell: bash
@@ -292,30 +291,21 @@ jobs:
               ${CMAKE_CURRENT_SOURCE_DIR}/vendor/swiftshader/mac/${PAG_ARCH}/libGLESv2.dylib
             )
 
-            find_package(PkgConfig QUIET)
-            if (PkgConfig_FOUND)
-              pkg_check_modules(WEBP QUIET libwebp)
-              pkg_check_modules(WEBPMUX QUIET libwebpmux)
-            endif()
+            # ✅ 关键：用 pkg-config IMPORTED_TARGET，保证 -L(库目录) 不丢
+            find_package(PkgConfig REQUIRED)
+            pkg_check_modules(WEBP REQUIRED IMPORTED_TARGET libwebp)
+            pkg_check_modules(WEBPMUX REQUIRED IMPORTED_TARGET libwebpmux)
 
-            if (WEBP_FOUND AND WEBPMUX_FOUND)
-              include_directories(${WEBP_INCLUDE_DIRS} ${WEBPMUX_INCLUDE_DIRS})
-              list(APPEND libs ${WEBP_LIBRARIES} ${WEBPMUX_LIBRARIES})
-              add_link_options(${WEBP_LDFLAGS} ${WEBPMUX_LDFLAGS})
-            else()
-              find_library(WEBP_LIB NAMES webp)
-              find_library(WEBPMUX_LIB NAMES webpmux)
-              if (NOT WEBP_LIB OR NOT WEBPMUX_LIB)
-                message(FATAL_ERROR "libwebp not found. Please: brew install webp")
-              endif()
-              list(APPEND libs ${WEBP_LIB} ${WEBPMUX_LIB})
-            endif()
+            list(APPEND libs
+              PkgConfig::WEBP
+              PkgConfig::WEBPMUX
+            )
+
+            target_link_libraries(pag2webp ${libs})
 
           else()
             message(FATAL_ERROR "This CMakeLists is intended to be used by mac CLI workflow.")
           endif()
-
-          target_link_libraries(pag2webp ${libs})
           CMAKE
 
       # ------------------------------------------------------------
@@ -379,7 +369,7 @@ jobs:
           cmake --build linux/build_cli --target pag2webp -j 8
 
       # ------------------------------------------------------------
-      # 5) Package: copy dylibs (swiftshader + webp), rewrite install names, add rpath, ad-hoc codesign
+      # 5) Package portable (no brew needed on target mac)
       # ------------------------------------------------------------
       - name: Package portable (no brew needed on target mac)
         shell: bash
@@ -398,23 +388,19 @@ jobs:
           cp "linux/vendor/swiftshader/mac/$ARCH/libEGL.dylib" dist/
           cp "linux/vendor/swiftshader/mac/$ARCH/libGLESv2.dylib" dist/
 
-          # libwebp: 把 brew 的 dylib 一起带上（目标机无 brew 也能跑）
-          # 不同版本可能有不同后缀，这里用通配符拷贝常见集合
+          # libwebp: 目标机无 brew 也能跑
           cp -a "$WEBP_PREFIX/lib"/libwebp*.dylib dist/ || true
           cp -a "$WEBP_PREFIX/lib"/libwebpmux*.dylib dist/ || true
           cp -a "$WEBP_PREFIX/lib"/libwebpdemux*.dylib dist/ || true
           cp -a "$WEBP_PREFIX/lib"/libsharpyuv*.dylib dist/ || true
 
-          # 给可执行文件加 rpath：从自身目录找 dylib
           install_name_tool -add_rpath "@executable_path" dist/pag2webp || true
 
-          # 统一所有 dylib 的 install id 为 @rpath/xxx.dylib
           for f in dist/*.dylib; do
             bn="$(basename "$f")"
             install_name_tool -id "@rpath/$bn" "$f" || true
           done
 
-          # 把 pag2webp 里“绝对路径依赖”改成 @rpath/xxx
           while read -r dep; do
             [ -z "$dep" ] && continue
             case "$dep" in
@@ -427,7 +413,6 @@ jobs:
             esac
           done < <(otool -L dist/pag2webp | awk 'NR>1{print $1}')
 
-          # 同理：把 dist 里 dylib 的依赖也改成 @rpath（避免它们继续引用 /opt/homebrew/...）
           for lib in dist/*.dylib; do
             while read -r dep; do
               [ -z "$dep" ] && continue
@@ -442,13 +427,11 @@ jobs:
             done < <(otool -L "$lib" | awk 'NR>1{print $1}')
           done
 
-          # ad-hoc codesign：install_name_tool 会破坏原签名，必须重签，否则有概率 dyld 拒绝加载
           codesign --force --sign - dist/pag2webp
           for f in dist/*.dylib; do
             codesign --force --sign - "$f" || true
           done
 
-          # 便捷脚本（可选）
           cat > dist/run.sh <<'EOF'
           #!/usr/bin/env bash
           set -e
@@ -459,7 +442,6 @@ jobs:
 
           echo "== otool -L pag2webp =="
           otool -L dist/pag2webp || true
-
           echo "== dist contents =="
           ls -la dist
 
