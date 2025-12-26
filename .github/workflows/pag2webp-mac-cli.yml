@@ -412,15 +412,12 @@ jobs:
           fi
           cp -a third_party/tgfx/vendor/swiftshader/mac/$ARCH/* linux/vendor/swiftshader/mac/$ARCH/
 
-          # normalize libpag.a into: linux/vendor/libpag/mac/$ARCH/libpag.a
-          LIBPAG_A="$(find linux/vendor/libpag/mac -name libpag.a | head -n 1 || true)"
-          if [ -z "$LIBPAG_A" ]; then
-            echo "libpag.a not found under linux/vendor/libpag/mac"
-            find linux/vendor/libpag/mac -maxdepth 4 -type f || true
+          # build_pag 已经输出到固定路径：不要再 self-copy
+          if [ ! -f "linux/vendor/libpag/mac/$ARCH/libpag.a" ]; then
+            echo "Expected libpag.a missing: linux/vendor/libpag/mac/$ARCH/libpag.a"
+            find linux/vendor/libpag/mac -maxdepth 6 -name libpag.a -print || true
             exit 1
           fi
-          mkdir -p linux/vendor/libpag/mac/$ARCH
-          cp -f "$LIBPAG_A" "linux/vendor/libpag/mac/$ARCH/libpag.a"
 
           echo "== staged =="
           ls -la "linux/vendor/libpag/mac/$ARCH/libpag.a"
