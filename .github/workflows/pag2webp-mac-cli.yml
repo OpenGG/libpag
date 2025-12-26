@@ -1,0 +1,486 @@
+name: pag2webp-mac-cli
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+jobs:
+  mac_cli:
+    name: mac_cli (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ✅ Apple Silicon (优先)
+          - os: macos-latest
+            arch: arm64
+            osx_arch: arm64
+            artifact: pag2webp-mac-arm64
+
+          # 可选：Intel（不需要就删掉这一段）
+          - os: macos-13
+            arch: x64
+            osx_arch: x86_64
+            artifact: pag2webp-mac-x64
+
+    steps:
+      - name: Check Out Repo
+        uses: actions/checkout@v4
+
+      - name: Get Third-Party Cache
+        id: third-party-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: third_party
+          key: third-party-maccli-${{ matrix.arch }}-${{ hashFiles('DEPS') }}-${{ hashFiles('vendor.json') }}
+          restore-keys: third-party-maccli-${{ matrix.arch }}-
+
+      - name: Install deps (brew)
+        run: |
+          brew update
+          brew install cmake ninja yasm pkg-config webp
+        shell: bash
+
+      - name: Install Build Tools
+        run: |
+          chmod +x install_tools.sh
+          ./install_tools.sh
+        shell: bash
+
+      - name: Run depsync
+        run: |
+          npm install depsync -g
+          depsync
+        shell: bash
+
+      # ------------------------------------------------------------
+      # 1) 在 CI 内 patch：覆盖 linux/src/main.cpp -> animated webp CLI
+      # ------------------------------------------------------------
+      - name: Patch linux/src/main.cpp (PAG -> animated WebP)
+        run: |
+          set -e
+          cat > linux/src/main.cpp <<'CPP'
+          #include <pag/file.h>
+          #include <pag/pag.h>
+
+          #include <webp/encode.h>
+          #include <webp/mux.h>
+
+          #include <cmath>
+          #include <cstdint>
+          #include <fstream>
+          #include <iostream>
+          #include <string>
+          #include <vector>
+
+          static void WriteFile(const std::string& path, const uint8_t* data, size_t size) {
+            std::ofstream out(path, std::ios::binary);
+            out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
+            out.close();
+          }
+
+          static void UnpremultiplyBGRA(uint8_t* bgra, int w, int h) {
+            const int n = w * h;
+            for (int i = 0; i < n; i++) {
+              uint8_t* p = bgra + i * 4;  // B,G,R,A
+              const int a = p[3];
+              if (a == 0) {
+                p[0] = p[1] = p[2] = 0;
+                continue;
+              }
+              p[0] = (uint8_t)std::min(255, (p[0] * 255 + a / 2) / a);
+              p[1] = (uint8_t)std::min(255, (p[1] * 255 + a / 2) / a);
+              p[2] = (uint8_t)std::min(255, (p[2] * 255 + a / 2) / a);
+            }
+          }
+
+          static const char* GetArg(int argc, char** argv, const char* key, const char* def = nullptr) {
+            for (int i = 1; i + 1 < argc; i++) {
+              if (std::string(argv[i]) == key) return argv[i + 1];
+            }
+            return def;
+          }
+
+          static bool HasFlag(int argc, char** argv, const char* key) {
+            for (int i = 1; i < argc; i++) {
+              if (std::string(argv[i]) == key) return true;
+            }
+            return false;
+          }
+
+          static std::vector<std::string> GetMultiArgs(int argc, char** argv, const char* key) {
+            std::vector<std::string> res;
+            for (int i = 1; i + 1 < argc; i++) {
+              if (std::string(argv[i]) == key) res.emplace_back(argv[i + 1]);
+            }
+            return res;
+          }
+
+          static void Usage() {
+            std::cerr <<
+          R"(Usage:
+            pag2webp input.pag output.webp [options]
+
+          Options:
+            --fps N                override fps (default: PAG frameRate)
+            --quality Q            0..100 (default: 75)
+            --lossless 0|1         (default: 0)
+            --loop N               0=infinite (default: 0)
+            --no_unpremultiply     disable unpremultiply (default: enabled)
+
+            --replace_image path.png
+            --replace_text "text..."
+            --text_font path.ttf|otf
+            --fallback_font path.ttf|otf   (repeatable)
+
+          Example:
+            pag2webp a.pag a.webp --quality 80 --loop 0
+          )";
+          }
+
+          int main(int argc, char** argv) {
+            if (argc < 3) {
+              Usage();
+              return 1;
+            }
+
+            const std::string inPath = argv[1];
+            const std::string outPath = argv[2];
+
+            const char* fpsStr = GetArg(argc, argv, "--fps", nullptr);
+            const float fpsOverride = fpsStr ? std::stof(fpsStr) : 0.0f;
+
+            const int quality = std::stoi(GetArg(argc, argv, "--quality", "75"));
+            const int lossless = std::stoi(GetArg(argc, argv, "--lossless", "0"));
+            const int loopCount = std::stoi(GetArg(argc, argv, "--loop", "0"));
+
+            const bool doUnpremultiply = !HasFlag(argc, argv, "--no_unpremultiply");
+
+            const char* replaceImage = GetArg(argc, argv, "--replace_image", nullptr);
+            const char* replaceText  = GetArg(argc, argv, "--replace_text", nullptr);
+            const char* textFontPath = GetArg(argc, argv, "--text_font", nullptr);
+            const auto fallbackFonts = GetMultiArgs(argc, argv, "--fallback_font");
+
+            if (!fallbackFonts.empty()) {
+              std::vector<int> ttcIndices(fallbackFonts.size(), 0);
+              pag::PAGFont::SetFallbackFontPaths(fallbackFonts, ttcIndices);
+            }
+
+            auto pagFile = pag::PAGFile::Load(inPath);
+            if (!pagFile) {
+              std::cerr << "Failed to load PAG: " << inPath << "\n";
+              return 2;
+            }
+
+            if (replaceImage) {
+              for (int i = 0; i < pagFile->numImages(); i++) {
+                auto img = pag::PAGImage::FromPath(replaceImage);
+                pagFile->replaceImage(i, img);
+              }
+            }
+
+            if (replaceText) {
+              pag::PAGFont used{};
+              bool hasFont = false;
+              if (textFontPath) {
+                used = pag::PAGFont::RegisterFont(textFontPath, 0);
+                hasFont = true;
+              }
+              for (int i = 0; i < pagFile->numTexts(); i++) {
+                auto textDoc = pagFile->getTextData(i);
+                textDoc->text = replaceText;
+                if (hasFont) {
+                  textDoc->fontFamily = used.fontFamily;
+                  textDoc->fontStyle = used.fontStyle;
+                }
+                pagFile->replaceText(i, textDoc);
+              }
+            }
+
+            const int w = pagFile->width();
+            const int h = pagFile->height();
+            const float fps = (fpsOverride > 0.0f) ? fpsOverride : pagFile->frameRate();
+
+            const int64_t durationUs = pagFile->duration();
+            const int64_t lastFrame = (int64_t)std::floor(durationUs * fps / 1000000.0);
+            const int frameCount = (int)lastFrame + 1;
+
+            auto surface = pag::PAGSurface::MakeOffscreen(w, h);
+            if (!surface) {
+              std::cerr << "MakeOffscreen failed\n";
+              return 3;
+            }
+
+            auto player = std::make_unique<pag::PAGPlayer>();
+            player->setSurface(surface);
+            player->setComposition(pagFile);
+
+            WebPAnimEncoderOptions enc_opts;
+            WebPAnimEncoderOptionsInit(&enc_opts);
+            enc_opts.anim_params.bgcolor = 0x00000000;
+            enc_opts.anim_params.loop_count = loopCount;
+
+            WebPAnimEncoder* enc = WebPAnimEncoderNew(w, h, &enc_opts);
+            if (!enc) {
+              std::cerr << "WebPAnimEncoderNew failed\n";
+              return 4;
+            }
+
+            WebPConfig config;
+            WebPConfigInit(&config);
+            config.quality = (float)quality;
+            config.lossless = lossless ? 1 : 0;
+            config.method = 4;
+            if (!WebPValidateConfig(&config)) {
+              std::cerr << "Invalid WebP config\n";
+              WebPAnimEncoderDelete(enc);
+              return 5;
+            }
+
+            const int stride = w * 4;
+            std::vector<uint8_t> pixels((size_t)stride * h);
+
+            auto frameToMs = [&](int i) -> int {
+              return (int)std::llround((double)i * 1000.0 / (double)fps);
+            };
+
+            for (int i = 0; i < frameCount; i++) {
+              const double progress = (frameCount <= 1) ? 0.0 : ((double)i / (double)(frameCount - 1));
+              player->setProgress(progress);
+              player->flush();
+
+              surface->readPixels(pag::ColorType::BGRA_8888,
+                                  pag::AlphaType::Premultiplied,
+                                  pixels.data(),
+                                  stride);
+
+              if (doUnpremultiply) {
+                UnpremultiplyBGRA(pixels.data(), w, h);
+              }
+
+              WebPPicture pic;
+              WebPPictureInit(&pic);
+              pic.width = w;
+              pic.height = h;
+              pic.use_argb = 1;
+
+              if (!WebPPictureImportBGRA(&pic, pixels.data(), stride)) {
+                std::cerr << "WebPPictureImportBGRA failed at frame " << i << "\n";
+                WebPPictureFree(&pic);
+                WebPAnimEncoderDelete(enc);
+                return 6;
+              }
+
+              const int ts = frameToMs(i);
+              if (!WebPAnimEncoderAdd(enc, &pic, ts, &config)) {
+                std::cerr << "WebPAnimEncoderAdd failed at frame " << i << "\n";
+                WebPPictureFree(&pic);
+                WebPAnimEncoderDelete(enc);
+                return 7;
+              }
+              WebPPictureFree(&pic);
+            }
+
+            const int endTs = frameToMs(frameCount);
+            WebPAnimEncoderAdd(enc, nullptr, endTs, nullptr);
+
+            WebPData out;
+            WebPDataInit(&out);
+            if (!WebPAnimEncoderAssemble(enc, &out)) {
+              std::cerr << "WebPAnimEncoderAssemble failed\n";
+              WebPAnimEncoderDelete(enc);
+              return 8;
+            }
+
+            WriteFile(outPath, out.bytes, out.size);
+            WebPDataClear(&out);
+            WebPAnimEncoderDelete(enc);
+
+            std::cout << "OK: " << outPath << " (" << w << "x" << h
+                      << ", fps=" << fps << ", frames=" << frameCount << ")\n";
+            return 0;
+          }
+          CPP
+        shell: bash
+
+      # ------------------------------------------------------------
+      # 2) 在 CI 内 patch：覆盖 linux/CMakeLists.txt -> 适配 mac + webp
+      # ------------------------------------------------------------
+      - name: Patch linux/CMakeLists.txt (mac + webp)
+        run: |
+          set -e
+          cat > linux/CMakeLists.txt <<'CMAKE'
+          cmake_minimum_required(VERSION 3.16)
+          project(pag2webp LANGUAGES C CXX)
+          set(CMAKE_CXX_STANDARD 17)
+
+          add_definitions(-DSWIFTSHADER)
+          add_definitions(-DGL_GLEXT_PROTOTYPES)
+          add_definitions(-DEGL_EGLEXT_PROTOTYPES)
+
+          if (NOT DEFINED PAG_ARCH)
+            set(PAG_ARCH "arm64")
+          endif()
+
+          add_executable(pag2webp src/main.cpp)
+
+          include_directories(${CMAKE_CURRENT_SOURCE_DIR}/vendor/libpag/include
+                              src)
+
+          if (APPLE AND NOT IOS)
+            find_library(APPLICATION_SERVICES_FRAMEWORK ApplicationServices REQUIRED)
+            find_library(QUARTZ_CORE QuartzCore REQUIRED)
+            find_library(COCOA Cocoa REQUIRED)
+            find_library(FOUNDATION Foundation REQUIRED)
+            find_library(VIDEOTOOLBOX VideoToolbox)
+            find_library(COMPRESSION_LIBRARIES NAMES compression)
+
+            list(APPEND libs
+              ${APPLICATION_SERVICES_FRAMEWORK}
+              ${QUARTZ_CORE}
+              ${COCOA}
+              ${FOUNDATION}
+              ${VIDEOTOOLBOX}
+              ${COMPRESSION_LIBRARIES}
+              ${CMAKE_CURRENT_SOURCE_DIR}/vendor/libpag/mac/${PAG_ARCH}/libpag.a
+              ${CMAKE_CURRENT_SOURCE_DIR}/vendor/swiftshader/mac/${PAG_ARCH}/libEGL.dylib
+              ${CMAKE_CURRENT_SOURCE_DIR}/vendor/swiftshader/mac/${PAG_ARCH}/libGLESv2.dylib
+            )
+
+            find_package(PkgConfig QUIET)
+            if (PkgConfig_FOUND)
+              pkg_check_modules(WEBP QUIET libwebp)
+              pkg_check_modules(WEBPMUX QUIET libwebpmux)
+            endif()
+
+            if (WEBP_FOUND AND WEBPMUX_FOUND)
+              include_directories(${WEBP_INCLUDE_DIRS} ${WEBPMUX_INCLUDE_DIRS})
+              list(APPEND libs ${WEBP_LIBRARIES} ${WEBPMUX_LIBRARIES})
+              add_link_options(${WEBP_LDFLAGS} ${WEBPMUX_LDFLAGS})
+            else()
+              find_library(WEBP_LIB NAMES webp)
+              find_library(WEBPMUX_LIB NAMES webpmux)
+              if (NOT WEBP_LIB OR NOT WEBPMUX_LIB)
+                message(FATAL_ERROR "libwebp not found. Please: brew install webp")
+              endif()
+              list(APPEND libs ${WEBP_LIB} ${WEBPMUX_LIB})
+            endif()
+
+          else()
+            message(FATAL_ERROR "This CMakeLists is intended to be used by mac CLI workflow.")
+          endif()
+
+          target_link_libraries(pag2webp ${libs})
+          CMAKE
+        shell: bash
+
+      # ------------------------------------------------------------
+      # 3) 自动复制/归一化：build_pag + headers + swiftshader -> linux/vendor/...
+      # ------------------------------------------------------------
+      - name: Build libpag (static) and stage vendor deps
+        run: |
+          set -e
+          ARCH="${{ matrix.arch }}"
+
+          mkdir -p third_party/tgfx/out/cache
+
+          # libpag output dir (we'll normalize afterwards)
+          mkdir -p linux/vendor/libpag/mac
+          mkdir -p linux/vendor/libpag/include
+          mkdir -p linux/vendor/swiftshader/mac/$ARCH
+
+          node build_pag -p mac -a "$ARCH" \
+            -DPAG_USE_SWIFTSHADER=ON \
+            -DPAG_BUILD_SHARED=OFF \
+            -DPAG_BUILD_FRAMEWORK=OFF \
+            -o linux/vendor/libpag/mac
+
+          # headers
+          rm -rf linux/vendor/libpag/include
+          mkdir -p linux/vendor/libpag/include
+          cp -a include/* linux/vendor/libpag/include/
+
+          # swiftshader dylibs for this arch
+          if [ ! -d "third_party/tgfx/vendor/swiftshader/mac/$ARCH" ]; then
+            echo "SwiftShader dir not found: third_party/tgfx/vendor/swiftshader/mac/$ARCH"
+            ls -la third_party/tgfx/vendor/swiftshader/mac || true
+            exit 1
+          fi
+          cp -a third_party/tgfx/vendor/swiftshader/mac/$ARCH/* linux/vendor/swiftshader/mac/$ARCH/
+
+          # normalize libpag.a into: linux/vendor/libpag/mac/$ARCH/libpag.a
+          LIBPAG_A="$(find linux/vendor/libpag/mac -name libpag.a | head -n 1 || true)"
+          if [ -z "$LIBPAG_A" ]; then
+            echo "libpag.a not found under linux/vendor/libpag/mac"
+            find linux/vendor/libpag/mac -maxdepth 4 -type f || true
+            exit 1
+          fi
+          mkdir -p linux/vendor/libpag/mac/$ARCH
+          cp -f "$LIBPAG_A" "linux/vendor/libpag/mac/$ARCH/libpag.a"
+
+          echo "== staged =="
+          ls -la "linux/vendor/libpag/mac/$ARCH/libpag.a"
+          ls -la "linux/vendor/swiftshader/mac/$ARCH/libEGL.dylib"
+          ls -la "linux/vendor/swiftshader/mac/$ARCH/libGLESv2.dylib"
+        shell: bash
+
+      # ------------------------------------------------------------
+      # 4) build + 打包 + 上传 artifact
+      # ------------------------------------------------------------
+      - name: Build pag2webp
+        run: |
+          set -e
+          ARCH="${{ matrix.arch }}"
+          export PKG_CONFIG_PATH="$(brew --prefix webp)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+          cmake -S linux -B linux/build_cli -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPAG_ARCH="$ARCH" \
+            -DCMAKE_OSX_ARCHITECTURES="${{ matrix.osx_arch }}"
+
+          cmake --build linux/build_cli --target pag2webp -j 8
+        shell: bash
+
+      - name: Package
+        run: |
+          set -e
+          ARCH="${{ matrix.arch }}"
+          mkdir -p dist
+
+          cp linux/build_cli/pag2webp dist/pag2webp
+          chmod +x dist/pag2webp
+
+          cp "linux/vendor/swiftshader/mac/$ARCH/libEGL.dylib" dist/
+          cp "linux/vendor/swiftshader/mac/$ARCH/libGLESv2.dylib" dist/
+
+          cat > dist/run.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -e
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          export DYLD_LIBRARY_PATH="$DIR:${DYLD_LIBRARY_PATH:-}"
+          exec "$DIR/pag2webp" "$@"
+          EOF
+          chmod +x dist/run.sh
+
+          echo "== file =="
+          file dist/pag2webp
+          echo "== otool -L =="
+          otool -L dist/pag2webp || true
+        shell: bash
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+
+      - name: Save Third-Party Cache
+        if: ${{ (github.event_name == 'push') && (steps.third-party-cache.outputs.cache-hit != 'true') }}
+        uses: actions/cache/save@v4
+        with:
+          path: third_party
+          key: third-party-maccli-${{ matrix.arch }}-${{ hashFiles('DEPS') }}-${{ hashFiles('vendor.json') }}
